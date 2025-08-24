@@ -1,4 +1,6 @@
 {
-    "input": {}
+    "input": {
+        "dataset_id": "sbussiso/4chan-pairs"
+    }
 }
   
