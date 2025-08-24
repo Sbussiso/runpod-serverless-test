@@ -1,7 +1,7 @@
-import os, json, time, tempfile, pathlib, requests
+import os, json, time, tempfile
 import runpod
 import torch
-from datasets import Dataset
+from datasets import load_dataset, Dataset
 from huggingface_hub import create_repo, HfApi, login
 from unsloth import FastLanguageModel
 from trl import SFTTrainer
@@ -12,25 +12,42 @@ DTYPE = None
 LOAD_IN_4BIT = True
 BASE_MODEL = "unsloth/Phi-3-mini-4k-instruct-bnb-4bit"
 
-def load_dataset(local_path: str | None, dataset_url: str | None):
-    if dataset_url:
-        # Download into a temp file (good for large sets)
-        r = requests.get(dataset_url, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-    else:
-        if not local_path or not os.path.exists(local_path):
-            raise FileNotFoundError("scraped_training_data.json not found and no dataset_url provided.")
-        with open(local_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    # Your format
-    def fmt(ex): return f"### Input: {ex['input']}\n### Output: {json.dumps(ex['output'])}<|endoftext|>"
-    formatted = [fmt(x) for x in data]
-    return Dataset.from_dict({"text": formatted})
+def hf_login_if_available():
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        login(token=tok, add_to_git_credential=False)
+
+def load_hf_dataset(
+    dataset_id: str,
+    split: str = "train",
+    revision: str | None = None,
+    input_field: str = "input",
+    output_field: str = "output",
+    num_proc: int = 2,
+):
+    """
+    Loads a dataset from the HF Hub and maps it to a single 'text' column:
+    '### Input: ...\n### Output: ...<|endoftext|>'
+    """
+    # Assumes HF_TOKEN is set for private datasets
+    ds = load_dataset(dataset_id, split=split, revision=revision)
+
+    def _fmt(example):
+        inp = example[input_field]
+        out = example[output_field]
+        # Ensure both are JSON-safe strings
+        try:
+            out_str = json.dumps(out, ensure_ascii=False)
+        except Exception:
+            out_str = json.dumps(str(out), ensure_ascii=False)
+        return {"text": f"### Input: {inp}\n### Output: {out_str}<|endoftext|>"}
+
+    # Map in place without materializing a giant Python list
+    ds = ds.map(_fmt, remove_columns=ds.column_names, num_proc=num_proc)
+    return ds
 
 def train_one_run(dataset: Dataset, output_dir: str):
     # load model
-    t0 = time.time()
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ_LEN,
@@ -79,19 +96,18 @@ def train_one_run(dataset: Dataset, output_dir: str):
         ),
     )
 
-    # GPU stats before train
+    # GPU stats
     gpu = torch.cuda.get_device_properties(0)
     start_reserved = round(torch.cuda.max_memory_reserved()/1024/1024/1024, 3)
     res = trainer.train()
-    # after
     used = round(torch.cuda.max_memory_reserved()/1024/1024/1024, 3)
     lora_used = round(used - start_reserved, 3)
     pct = round(used / (gpu.total_memory/1024/1024/1024) * 100, 3)
     lpct = round(lora_used / (gpu.total_memory/1024/1024/1024) * 100, 3)
 
     # save LoRA adapter + tokenizer
-    model.save_pretrained(output_dir + "/finetuned_model")
-    tokenizer.save_pretrained(output_dir + "/finetuned_model")
+    model.save_pretrained(os.path.join(output_dir, "finetuned_model"))
+    tokenizer.save_pretrained(os.path.join(output_dir, "finetuned_model"))
 
     stats = {
         "train_runtime_s": float(res.metrics["train_runtime"]),
@@ -105,10 +121,10 @@ def train_one_run(dataset: Dataset, output_dir: str):
     return stats
 
 def upload_to_hf(folder: str, repo_name: str | None):
-    token = os.environ.get("HF_TOKEN")
-    if not token:
+    tok = os.environ.get("HF_TOKEN")
+    if not tok:
         raise RuntimeError("HF_TOKEN env var not set.")
-    login(token=token, add_to_git_credential=False)
+    login(token=tok, add_to_git_credential=False)
 
     api = HfApi()
     username = api.whoami()["name"]
@@ -119,25 +135,44 @@ def upload_to_hf(folder: str, repo_name: str | None):
 
 def handler(event):
     """
-    Inputs (optional):
-      - dataset_url: HTTP(S) link to scraped_training_data.json if not baked into the image
-      - repo_name: Hugging Face repo suffix, defaults to 'runpod_model'
+    Inputs:
+      - dataset_id (str): e.g. "sbussiso/4chan-pairs"
+      - split (str, optional): e.g. "train" (default)
+      - revision (str, optional): HF commit SHA / tag for reproducibility
+      - input_field (str, optional): default "input"
+      - output_field (str, optional): default "output"
+      - repo_name (str, optional): HF model repo name suffix (default "runpod_model")
     """
-    inp = event.get("input", {}) or {}
-    dataset_url = inp.get("dataset_url")
-    repo_name = inp.get("repo_name")
+    inp = event.get("input") or {}
+    dataset_id  = inp.get("dataset_id")             # REQUIRED
+    split       = inp.get("split", "train")
+    revision    = inp.get("revision")               # optional pin
+    in_col      = inp.get("input_field", "input")
+    out_col     = inp.get("output_field", "output")
+    repo_name   = inp.get("repo_name")
 
-    # Prepare workspace
+    if not dataset_id:
+        raise ValueError("dataset_id is required, e.g. 'sbussiso/4chan-pairs'.")
+
+    # Login once so we can read private datasets and later push the model
+    hf_login_if_available()
+
+    # Workspace
     workdir = tempfile.mkdtemp(prefix="train_")
     out_dir = os.path.join(workdir, "outputs")
 
-    # Load dataset (from URL or local file)
-    ds = load_dataset("/app/scraped_training_data.json", dataset_url)
+    # Load HF dataset by name
+    ds = load_hf_dataset(
+        dataset_id=dataset_id,
+        split=split,
+        revision=revision,
+        input_field=in_col,
+        output_field=out_col,
+        num_proc=2,
+    )
 
-    # Train
+    # Train + upload
     stats = train_one_run(ds, out_dir)
-
-    # Upload (push only the saved model folder)
     repo_id = upload_to_hf(os.path.join(out_dir, "finetuned_model"), repo_name)
 
     return {"ok": True, "repo_id": repo_id, "stats": stats}
